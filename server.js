@@ -21,6 +21,7 @@ const io = socketio(expressServer,{
     cors: {
         origin: [
             "https://localhost",
+            "https://abdelilah1223.github.io/webrtc-starter/",
             // 'https://LOCAL-DEV-IP-HERE' //if using a phone or another computer
         ],
         methods: ["GET", "POST"]
