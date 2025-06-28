@@ -58,82 +58,213 @@ io.on('connection',(socket)=>{
 
     //a new client has joined. If there are any offers available,
     //emit them out
-    if(offers.length){
-        socket.emit('availableOffers',offers);
-    }
-    
+    socket.emit('availableOffers',offers); // Send all current offers to the new client
+    io.emit('connectedUsers', connectedSockets.map(s => s.userName)); // Send updated user list to all clients
+
     socket.on('newOffer',newOffer=>{
-        offers.push({
+        // Check if user already has an active offer
+        const existingOffer = offers.find(o => o.offererUserName === userName);
+        if (existingOffer) {
+            // Optionally, notify the user that they already have an active offer
+            // For now, we'll just log it and not create a new one.
+            // Or, we could replace the old offer. For simplicity, let's prevent multiple offers.
+            console.log(`User ${userName} already has an active offer. New offer not created.`);
+            socket.emit('offerError', { message: "You already have an active offer. Please cancel it before creating a new one." });
+            return;
+        }
+
+        const offer = {
             offererUserName: userName,
-            offer: newOffer,
+            offer: newOffer, // This is the SDP offer
             offerIceCandidates: [],
             answererUserName: null,
-            answer: null,
+            answer: null, // SDP answer
             answererIceCandidates: []
-        })
-        // console.log(newOffer.sdp.slice(50))
-        //send out to all connected sockets EXCEPT the caller
-        socket.broadcast.emit('newOfferAwaiting',offers.slice(-1))
+        };
+        offers.push(offer);
+
+        console.log(`New offer created by ${userName}`);
+        //send out the new offer to all other connected sockets
+        socket.broadcast.emit('newOfferAwaiting',[offer]); // Send as an array for consistency with availableOffers
     })
 
     socket.on('newAnswer',(offerObj,ackFunction)=>{
-        console.log(offerObj);
-        //emit this answer (offerObj) back to CLIENT1
-        //in order to do that, we need CLIENT1's socketid
-        const socketToAnswer = connectedSockets.find(s=>s.userName === offerObj.offererUserName)
-        if(!socketToAnswer){
-            console.log("No matching socket")
+        console.log("New answer received", offerObj);
+        const offerer = connectedSockets.find(s=>s.userName === offerObj.offererUserName);
+        if(!offerer){
+            console.log("No matching offerer socket found for user:", offerObj.offererUserName);
             return;
         }
-        //we found the matching socket, so we can emit to it!
-        const socketIdToAnswer = socketToAnswer.socketId;
-        //we find the offer to update so we can emit it
-        const offerToUpdate = offers.find(o=>o.offererUserName === offerObj.offererUserName)
-        if(!offerToUpdate){
-            console.log("No OfferToUpdate")
+        const offererSocketId = offerer.socketId;
+
+        const offerIndex = offers.findIndex(o=>o.offererUserName === offerObj.offererUserName && !o.answererUserName);
+        if(offerIndex === -1){
+            console.log("No OfferToUpdate or offer already taken");
+            // Optionally, inform the client that the offer is no longer available
+            // ackFunction({error: "Offer no longer available"});
             return;
         }
-        //send back to the answerer all the iceCandidates we have already collected
-        ackFunction(offerToUpdate.offerIceCandidates);
-        offerToUpdate.answer = offerObj.answer
-        offerToUpdate.answererUserName = userName
-        //socket has a .to() which allows emiting to a "room"
-        //every socket has it's own room
-        socket.to(socketIdToAnswer).emit('answerResponse',offerToUpdate)
+
+        // Send back to the answerer all the ICE candidates we have already collected for the offer
+        ackFunction(offers[offerIndex].offerIceCandidates);
+
+        offers[offerIndex].answer = offerObj.answer;
+        offers[offerIndex].answererUserName = userName; // userName of the answerer (current socket)
+
+        // Emit the answer to the offerer
+        socket.to(offererSocketId).emit('answerResponse',offers[offerIndex]);
+
+        // Remove the offer from available offers as it's now taken
+        // Or mark it as connected. For simplicity, let's remove it.
+        // To ensure other clients get updated list of offers:
+        const updatedOffer = offers.splice(offerIndex, 1)[0]; // Remove the offer
+        io.emit('offerTaken', updatedOffer); // Inform all clients that this offer is taken
+        console.log(`Offer between ${updatedOffer.offererUserName} and ${updatedOffer.answererUserName} is now active.`);
     })
 
     socket.on('sendIceCandidateToSignalingServer',iceCandidateObj=>{
-        const { didIOffer, iceUserName, iceCandidate } = iceCandidateObj;
-        // console.log(iceCandidate);
+        const { didIOffer, iceUserName, iceCandidate, recipientUserName } = iceCandidateObj; // Added recipientUserName for direct calls
+
+        if (recipientUserName) { // Direct ICE candidate exchange
+            const recipientSocket = connectedSockets.find(s => s.userName === recipientUserName);
+            if (recipientSocket) {
+                socket.to(recipientSocket.socketId).emit('receivedIceCandidateFromServer', iceCandidate);
+            } else {
+                console.log(`ICE candidate for ${recipientUserName} but user not found.`);
+            }
+            return;
+        }
+
+        // Below is the existing logic for offer/answer based ICE exchange
+        let offer;
         if(didIOffer){
             //this ice is coming from the offerer. Send to the answerer
-            const offerInOffers = offers.find(o=>o.offererUserName === iceUserName);
-            if(offerInOffers){
-                offerInOffers.offerIceCandidates.push(iceCandidate)
-                // 1. When the answerer answers, all existing ice candidates are sent
-                // 2. Any candidates that come in after the offer has been answered, will be passed through
-                if(offerInOffers.answererUserName){
-                    //pass it through to the other socket
-                    const socketToSendTo = connectedSockets.find(s=>s.userName === offerInOffers.answererUserName);
-                    if(socketToSendTo){
-                        socket.to(socketToSendTo.socketId).emit('receivedIceCandidateFromServer',iceCandidate)
+            offer = offers.find(o=>o.offererUserName === iceUserName);
+            if(offer){
+                offer.offerIceCandidates.push(iceCandidate);
+                if(offer.answererUserName){
+                    const answererSocket = connectedSockets.find(s=>s.userName === offer.answererUserName);
+                    if(answererSocket){
+                        socket.to(answererSocket.socketId).emit('receivedIceCandidateFromServer',iceCandidate);
                     }else{
-                        console.log("Ice candidate recieved but could not find answere")
+                        console.log("Ice candidate received for offer, but answerer not found");
                     }
                 }
             }
         }else{
             //this ice is coming from the answerer. Send to the offerer
-            //pass it through to the other socket
-            const offerInOffers = offers.find(o=>o.answererUserName === iceUserName);
-            const socketToSendTo = connectedSockets.find(s=>s.userName === offerInOffers.offererUserName);
-            if(socketToSendTo){
-                socket.to(socketToSendTo.socketId).emit('receivedIceCandidateFromServer',iceCandidate)
-            }else{
-                console.log("Ice candidate recieved but could not find offerer")
+            // Find the offer where this user is the answerer
+            // Note: This logic might need adjustment if offers are removed immediately after connection.
+            // For now, assuming the offer might still exist or this is for a direct call not using the 'offers' array.
+            offer = offers.find(o=>o.answererUserName === iceUserName); // This might be problematic if offer is already removed.
+                                                                      // Consider a more robust way to find the peer if not using direct calls.
+            if (offer) { // Found an offer this user answered
+                 const offererSocket = connectedSockets.find(s=>s.userName === offer.offererUserName);
+                 if(offererSocket){
+                     socket.to(offererSocket.socketId).emit('receivedIceCandidateFromServer',iceCandidate);
+                 }else{
+                     console.log("Ice candidate received for answer, but offerer not found");
+                 }
+            } else {
+                 // Fallback or error: couldn't find an offer this user answered, and it's not a direct call.
+                 console.log(`Ice candidate from answerer ${iceUserName}, but no matching offer or direct call recipient.`);
             }
         }
-        // console.log(offers)
-    })
+    });
 
+    socket.on('callUser', (data) => {
+        const { targetUserName } = data;
+        const callingUser = connectedSockets.find(s => s.socketId === socket.id);
+        if (!callingUser) return; // Should not happen
+
+        const targetSocket = connectedSockets.find(s => s.userName === targetUserName);
+        if (targetSocket) {
+            console.log(`User ${callingUser.userName} is calling ${targetUserName}`);
+            socket.to(targetSocket.socketId).emit('incomingCall', {
+                fromUser: callingUser.userName
+            });
+        } else {
+            // Inform caller that target user is not available
+            socket.emit('callResponse', { success: false, message: `User ${targetUserName} is not online.` });
+        }
+    });
+
+    socket.on('directOffer', (data) => {
+        const { offer, targetUserName } = data;
+        const offerer = connectedSockets.find(s => s.socketId === socket.id);
+        if (!offerer) return;
+
+        const targetSocket = connectedSockets.find(s => s.userName === targetUserName);
+        if (targetSocket) {
+            console.log(`Forwarding direct offer from ${offerer.userName} to ${targetUserName}`);
+            socket.to(targetSocket.socketId).emit('offerReceived', {
+                offer,
+                offererUserName: offerer.userName
+            });
+        } else {
+            console.log(`Cannot forward direct offer to ${targetUserName}, user not found.`);
+        }
+    });
+
+    socket.on('directAnswer', (data) => {
+        const { answer, targetUserName } = data;
+        const answerer = connectedSockets.find(s => s.socketId === socket.id);
+        if (!answerer) return;
+
+        const targetSocket = connectedSockets.find(s => s.userName === targetUserName);
+        if (targetSocket) {
+            console.log(`Forwarding direct answer from ${answerer.userName} to ${targetUserName}`);
+            socket.to(targetSocket.socketId).emit('answerReceived', {
+                answer,
+                answererUserName: answerer.userName
+            });
+        } else {
+            console.log(`Cannot forward direct answer to ${targetUserName}, user not found.`);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`User ${userName} disconnected - Socket ID: ${socket.id}`);
+        const index = connectedSockets.findIndex(s => s.socketId === socket.id);
+        if (index !== -1) {
+            connectedSockets.splice(index, 1);
+            console.log('Removed from connectedSockets:', userName);
+        }
+
+        // Remove offers made by the disconnected user
+        const offersMadeByDisconnectedUser = offers.filter(offer => offer.offererUserName === userName);
+        offersMadeByDisconnectedUser.forEach(offer => {
+            const offerIndex = offers.indexOf(offer);
+            if (offerIndex !== -1) {
+                offers.splice(offerIndex, 1);
+                console.log(`Removed offer from ${userName}`);
+                // Notify other clients that this offer is no longer available
+                io.emit('offerRemoved', offer);
+            }
+        });
+
+        // Handle cases where the disconnected user was an answerer in an ongoing call or accepted offer
+        // This part is tricky if offers are removed immediately upon connection.
+        // If we want to notify the offerer that the answerer disconnected:
+        offers.forEach((offer, idx) => {
+            if (offer.answererUserName === userName) {
+                console.log(`User ${userName} (answerer) disconnected from an offer with ${offer.offererUserName}`);
+                const offererSocket = connectedSockets.find(s => s.userName === offer.offererUserName);
+                if (offererSocket) {
+                    // Notify the offerer that the answerer has left
+                    socket.to(offererSocket.socketId).emit('peerDisconnected', { peerUserName: userName });
+                }
+                // Make the offer available again or remove it
+                // For simplicity, let's assume the call ends. If the offer should become available:
+                // offers[idx].answererUserName = null;
+                // offers[idx].answer = null;
+                // io.emit('availableOffers', offers); // or a specific update
+                // For now, let's consider the call ended. The offerer might need to re-initiate.
+                // If offers are removed upon connection, this specific case (answerer disconnects from active call)
+                // would need a different tracking mechanism (e.g., active an array of active calls).
+            }
+        });
+        io.emit('availableOffers', offers); // Send updated offers list
+        io.emit('connectedUsers', connectedSockets.map(s => s.userName)); // Send updated user list
+    });
 })
